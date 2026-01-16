@@ -510,3 +510,113 @@ def build_full_context(
     estimated_tokens = estimate_tokens(full_context)
 
     return full_context, files_used, estimated_tokens
+
+
+def build_base_context(
+    repo_path: Path,
+    index: RepoIndex,
+    signals_data: dict,
+    config: ScanConfig | None = None,
+) -> tuple[str, int]:
+    """
+    Build the base repository context for Anthropic prompt caching.
+
+    This context is shared across all artifact generations and cached
+    server-side by Anthropic. Subsequent requests with the same prefix
+    get a 90% discount on input tokens.
+
+    Includes:
+    - Repository file tree structure
+    - Detected signals (languages, frameworks, maturity)
+    - Key configuration files (package.json, pyproject.toml, etc.)
+
+    Args:
+        repo_path: Repository path
+        index: Repository index
+        signals_data: Extracted signals
+        config: Scan configuration
+
+    Returns:
+        Tuple of (base_context, estimated_tokens)
+    """
+    if config is None:
+        config = ScanConfig()
+
+    parts: list[str] = [
+        "# Repository Context",
+        "",
+        "You are analyzing a code repository. Below is the complete context about this repository.",
+        "Use this information to generate accurate, repo-specific artifacts.",
+        "",
+    ]
+
+    # Add file tree
+    tree_context = create_file_tree_context(index, max_files=100)
+    parts.append(tree_context)
+
+    # Add signals
+    signals_context = create_signals_context(signals_data)
+    parts.append(signals_context)
+
+    # Add key files that are always relevant (shared across all artifacts)
+    key_files = [
+        "README.md",
+        "readme.md",
+        "package.json",
+        "pyproject.toml",
+        "Cargo.toml",
+        "go.mod",
+        "Makefile",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/ci.yaml",
+    ]
+
+    file_map = {f.path: f for f in index.files}
+    key_excerpts: list[str] = []
+    total_bytes = 0
+    max_key_bytes = config.max_total_context_bytes // 2  # Reserve half for key files
+
+    for filename in key_files:
+        if total_bytes >= max_key_bytes:
+            break
+
+        if filename not in file_map:
+            continue
+
+        file_entry = file_map[filename]
+        if file_entry.is_binary:
+            continue
+
+        if is_sensitive_file(filename):
+            continue
+
+        content = get_file_content(
+            repo_path,
+            file_entry,
+            max_bytes=min(8192, config.max_excerpt_bytes),
+        )
+
+        if not content:
+            continue
+
+        safe_content, _ = get_safe_content(content, filename)
+        content_bytes = len(safe_content.encode("utf-8"))
+
+        if total_bytes + content_bytes > max_key_bytes:
+            continue
+
+        excerpt = f"### File: {filename}\n```\n{safe_content}\n```"
+        key_excerpts.append(excerpt)
+        total_bytes += content_bytes
+
+    if key_excerpts:
+        parts.append("\n## Key Configuration Files\n")
+        parts.append("\n\n".join(key_excerpts))
+
+    base_context = "\n\n".join(parts)
+    estimated_tokens = estimate_tokens(base_context)
+
+    return base_context, estimated_tokens

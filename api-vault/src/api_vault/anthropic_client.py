@@ -6,6 +6,7 @@ Provides a robust interface to the Anthropic API with:
 - Automatic retry with exponential backoff
 - Rate limit handling
 - Structured usage logging
+- Anthropic prompt caching for shared context prefixes
 """
 
 import hashlib
@@ -34,10 +35,13 @@ class GenerationResult:
     input_tokens: int
     output_tokens: int
     model: str
-    cached: bool
+    cached: bool  # Local file cache hit
     request_hash: str
     generation_time_seconds: float
     error: str | None = None
+    # Anthropic prompt caching stats
+    cache_creation_input_tokens: int = 0  # Tokens written to Anthropic cache
+    cache_read_input_tokens: int = 0  # Tokens read from Anthropic cache (90% discount)
 
 
 def canonicalize_json(data: Any) -> str:
@@ -182,6 +186,8 @@ class AnthropicClient:
         # Usage tracking
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.total_cache_creation_tokens = 0
+        self.total_cache_read_tokens = 0
         self.request_count = 0
 
     def _retry_with_backoff(
@@ -349,6 +355,150 @@ class AnthropicClient:
                 error=str(e),
             )
 
+    def generate_with_cached_context(
+        self,
+        cached_context: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        use_local_cache: bool = True,
+    ) -> GenerationResult:
+        """
+        Generate a completion using Anthropic's prompt caching for the context.
+
+        The cached_context is marked with cache_control to be cached server-side.
+        Subsequent requests with the same prefix get 90% discount on those tokens.
+
+        Args:
+            cached_context: Repository context to cache (file tree, signals, excerpts)
+            system_prompt: Additional system instructions (not cached)
+            user_prompt: User prompt for this specific artifact
+            max_tokens: Maximum output tokens
+            temperature: Sampling temperature
+            use_local_cache: Whether to use local file cache
+
+        Returns:
+            GenerationResult with response and metadata
+        """
+        start_time = time.time()
+
+        # Build the full system content with cache_control on the context
+        full_system = f"{cached_context}\n\n{system_prompt}"
+        request_hash = compute_request_hash(
+            self.model, full_system, user_prompt, max_tokens
+        )
+
+        # Check local file cache
+        if use_local_cache and self.cache_manager:
+            cached = self.cache_manager.get(request_hash)
+            if cached:
+                logger.info(f"Local cache hit for request {request_hash[:8]}")
+                return GenerationResult(
+                    text=cached.response_text,
+                    input_tokens=cached.input_tokens,
+                    output_tokens=cached.output_tokens,
+                    model=cached.model,
+                    cached=True,
+                    request_hash=request_hash,
+                    generation_time_seconds=0.0,
+                )
+
+        # Make API request with cache_control on the context portion
+        def make_request():
+            return self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=[
+                    {
+                        "type": "text",
+                        "text": cached_context,
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                    }
+                ],
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+
+        try:
+            response = self._retry_with_backoff(make_request)
+            generation_time = time.time() - start_time
+
+            # Extract text from response
+            text = ""
+            if response.content:
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text += block.text
+
+            # Extract usage including cache stats
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
+            cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+
+            # Update usage tracking
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_cache_creation_tokens += cache_creation
+            self.total_cache_read_tokens += cache_read
+            self.request_count += 1
+
+            # Cache the response locally
+            if use_local_cache and self.cache_manager:
+                cache_entry = CacheEntry(
+                    request_hash=request_hash,
+                    created_at=datetime.utcnow(),
+                    model=self.model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    response_text=text,
+                    prompt_template_id="",
+                    context_hash="",
+                )
+                self.cache_manager.set(cache_entry)
+
+            cache_status = ""
+            if cache_read > 0:
+                cache_status = f", {cache_read} from Anthropic cache"
+            elif cache_creation > 0:
+                cache_status = f", {cache_creation} written to Anthropic cache"
+
+            logger.info(
+                f"Generated response: {input_tokens} in, {output_tokens} out, "
+                f"{generation_time:.2f}s{cache_status}"
+            )
+
+            return GenerationResult(
+                text=text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=self.model,
+                cached=False,
+                request_hash=request_hash,
+                generation_time_seconds=generation_time,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+            )
+
+        except Exception as e:
+            generation_time = time.time() - start_time
+            logger.error(f"Generation failed: {e}")
+            return GenerationResult(
+                text="",
+                input_tokens=0,
+                output_tokens=0,
+                model=self.model,
+                cached=False,
+                request_hash=request_hash,
+                generation_time_seconds=generation_time,
+                error=str(e),
+            )
+
     def get_usage_summary(self) -> dict[str, Any]:
         """
         Get summary of API usage.
@@ -356,10 +506,24 @@ class AnthropicClient:
         Returns:
             Dictionary with usage statistics
         """
+        # Calculate effective tokens (cache reads are 90% cheaper)
+        effective_input = (
+            self.total_input_tokens
+            - self.total_cache_read_tokens  # Remove cache reads from total
+            + (self.total_cache_read_tokens * 0.1)  # Add back at 10% cost
+        )
+
         return {
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens": self.total_input_tokens + self.total_output_tokens,
+            "cache_creation_tokens": self.total_cache_creation_tokens,
+            "cache_read_tokens": self.total_cache_read_tokens,
+            "effective_input_tokens": int(effective_input),
+            "cache_savings_percent": (
+                round((1 - effective_input / self.total_input_tokens) * 100, 1)
+                if self.total_input_tokens > 0 else 0
+            ),
             "request_count": self.request_count,
             "model": self.model,
         }
@@ -388,8 +552,11 @@ class MockAnthropicClient:
         self.model = model or "mock-model"
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.total_cache_creation_tokens = 0
+        self.total_cache_read_tokens = 0
         self.request_count = 0
         self.requests: list[dict[str, Any]] = []
+        self._cached_context: str | None = None  # Track cached context for simulation
 
     def generate(
         self,
@@ -436,12 +603,93 @@ class MockAnthropicClient:
             generation_time_seconds=0.1,
         )
 
+    def generate_with_cached_context(
+        self,
+        cached_context: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        use_local_cache: bool = True,
+    ) -> GenerationResult:
+        """Generate mock response with simulated Anthropic prompt caching."""
+        full_system = f"{cached_context}\n\n{system_prompt}"
+        request_hash = compute_request_hash(
+            self.model, full_system, user_prompt, max_tokens
+        )
+
+        # Store request for verification
+        self.requests.append({
+            "cached_context": cached_context[:100] + "...",  # Truncate for readability
+            "system": system_prompt,
+            "user": user_prompt,
+            "max_tokens": max_tokens,
+            "hash": request_hash,
+            "uses_prompt_caching": True,
+        })
+
+        # Return predefined response or default
+        text = self.responses.get(
+            request_hash,
+            f"# Mock Response\n\nThis is a mock response for testing.\n\nRequest hash: {request_hash[:16]}"
+        )
+
+        # Simulate token counts
+        context_tokens = len(cached_context) // 4
+        system_tokens = len(system_prompt) // 4
+        user_tokens = len(user_prompt) // 4
+        output_tokens = len(text) // 4
+
+        # Simulate Anthropic cache behavior
+        cache_creation = 0
+        cache_read = 0
+        if self._cached_context == cached_context:
+            # Cache hit - context tokens are read from cache (90% discount)
+            cache_read = context_tokens
+        else:
+            # Cache miss - context is written to cache
+            cache_creation = context_tokens
+            self._cached_context = cached_context
+
+        input_tokens = context_tokens + system_tokens + user_tokens
+
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cache_creation_tokens += cache_creation
+        self.total_cache_read_tokens += cache_read
+        self.request_count += 1
+
+        return GenerationResult(
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            model=self.model,
+            cached=False,
+            request_hash=request_hash,
+            generation_time_seconds=0.1,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+        )
+
     def get_usage_summary(self) -> dict[str, Any]:
         """Get usage summary."""
+        effective_input = (
+            self.total_input_tokens
+            - self.total_cache_read_tokens
+            + (self.total_cache_read_tokens * 0.1)
+        )
+
         return {
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
             "total_tokens": self.total_input_tokens + self.total_output_tokens,
+            "cache_creation_tokens": self.total_cache_creation_tokens,
+            "cache_read_tokens": self.total_cache_read_tokens,
+            "effective_input_tokens": int(effective_input),
+            "cache_savings_percent": (
+                round((1 - effective_input / self.total_input_tokens) * 100, 1)
+                if self.total_input_tokens > 0 else 0
+            ),
             "request_count": self.request_count,
             "model": self.model,
         }

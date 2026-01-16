@@ -16,7 +16,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Protocol
 
-from api_vault.context_packager import build_full_context
+from api_vault.context_packager import build_base_context, build_full_context, package_context
 from api_vault.schemas import (
     ArtifactMeta,
     JobResult,
@@ -42,6 +42,17 @@ class GenerationClient(Protocol):
         max_tokens: int,
         temperature: float,
         use_cache: bool,
+    ) -> Any:
+        ...
+
+    def generate_with_cached_context(
+        self,
+        cached_context: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        temperature: float,
+        use_local_cache: bool,
     ) -> Any:
         ...
 
@@ -95,6 +106,16 @@ class Runner:
         # Convert signals to dict for context packaging
         self.signals_dict = (
             signals.model_dump() if hasattr(signals, "model_dump") else signals.__dict__
+        )
+
+        # Build base context once for Anthropic prompt caching
+        # This is shared across all artifact generations
+        self.base_context, self.base_context_tokens = build_base_context(
+            repo_path, index, self.signals_dict, config
+        )
+        logger.info(
+            f"Built base context: ~{self.base_context_tokens} tokens "
+            "(will be cached by Anthropic for subsequent requests)"
         )
 
     def _get_artifact_path(self, job: PlanJob) -> Path:
@@ -174,21 +195,26 @@ class Runner:
                 meta_path=str(self._get_meta_path(job)),
             )
 
-        # Build context
+        # Build artifact-specific context (additional file excerpts beyond base)
         if progress_callback:
             progress_callback(f"Building context for: {job.artifact_name}")
 
-        context, files_used, estimated_tokens = build_full_context(
+        # Package artifact-specific file excerpts
+        artifact_excerpts, files_used, excerpt_bytes = package_context(
             self.repo_path,
             self.index,
-            self.signals_dict,
             job.context_refs,
             self.config,
         )
-        context_hash = compute_context_hash(context)
 
-        # Get prompt template
-        prompt_result = render_prompt(job.prompt_template_id, context)
+        # Combine base context with artifact-specific excerpts for hash
+        full_context = self.base_context
+        if artifact_excerpts:
+            full_context += f"\n\n## Artifact-Specific Files\n\n{artifact_excerpts}"
+        context_hash = compute_context_hash(full_context)
+
+        # Get prompt template (pass artifact excerpts, not full context)
+        prompt_result = render_prompt(job.prompt_template_id, artifact_excerpts or "No additional context files.")
         if prompt_result is None:
             logger.error(f"Unknown prompt template: {job.prompt_template_id}")
             return JobResult(
@@ -199,16 +225,18 @@ class Runner:
 
         system_prompt, user_prompt = prompt_result
 
-        # Generate artifact
+        # Generate artifact using Anthropic prompt caching
+        # The base_context is cached server-side, saving ~90% on repeated input tokens
         if progress_callback:
             progress_callback(f"Generating: {job.artifact_name}")
 
-        result = self.client.generate(
+        result = self.client.generate_with_cached_context(
+            cached_context=self.base_context,
             system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            user_prompt=user_prompt if not artifact_excerpts else f"{user_prompt}\n\n## Additional Context\n\n{artifact_excerpts}",
             max_tokens=job.max_output_tokens,
             temperature=0.0,
-            use_cache=True,
+            use_local_cache=True,
         )
 
         if result.error:

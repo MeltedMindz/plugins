@@ -20,6 +20,7 @@ API credits and tokens often have expiration dates. Rather than letting quota ex
 - **Gap Analysis**: Identifies missing documentation and weak areas
 - **Smart Planning**: Prioritizes artifacts by value within your token budget
 - **Secret Protection**: Aggressive redaction of secrets before any API calls
+- **Anthropic Prompt Caching**: Repo context is cached server-side, saving ~80% on input tokens across multiple artifacts
 - **Deterministic Caching**: Same inputs produce same outputs; completed work is skipped
 - **Resumable**: Interrupt and restart without losing progress
 
@@ -193,6 +194,27 @@ These files are never read:
 | 50,000 tokens | 5-7 artifacts |
 | 100,000 tokens | 10-12 artifacts |
 | 200,000 tokens | All artifact types |
+
+### Anthropic Prompt Caching
+
+Api Vault uses [Anthropic's prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) to dramatically reduce costs when generating multiple artifacts.
+
+**How it works:**
+1. On the first artifact, the repository context (file tree, signals, key files) is sent and cached server-side
+2. For subsequent artifacts, the cached context is reused at 90% discount
+3. Only artifact-specific prompts incur full token costs
+
+**Cost savings example (10 artifacts, 8k context):**
+- Without caching: 10 × 8,000 = 80,000 input tokens
+- With caching: 8,000 + (9 × 800) = 15,200 effective input tokens
+- **Savings: ~81%**
+
+The report shows cache statistics:
+```
+Cache read tokens: 72,000 (from Anthropic cache)
+Effective input tokens: 15,200
+Cache savings: 81%
+```
 
 ## Development
 
