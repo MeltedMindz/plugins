@@ -1,0 +1,13 @@
+{
+  "name": "recall",
+  "version": "1.0.0",
+  "description": "Capture architectural decisions as they happen and make them queryable forever. Your codebase finally has a memory.",
+  "author": {
+    "name": "Plugin Factory"
+  },
+  "keywords": ["claude", "plugin", "architecture", "decisions", "documentation", "adr"],
+  "license": "MIT",
+  "engines": {
+    "claude-code": ">=1.0.0"
+  }
+}
